@@ -1,0 +1,629 @@
+const express = require("express");
+const Fee = require("../models/Fee");
+const BankTransaction = require("../models/BankTransaction");
+const User = require("../models/User");
+const SchoolClass = require("../models/SchoolClass");
+const Settings = require("../models/Settings");
+const { protect, authorize } = require("../middleware/auth");
+const { yearFilter } = require("../utils/academicYear");
+const { resolveRequiredFee, feeSourceLabel } = require("../utils/fees");
+const { sectionScope, levelAllowed, studentInScope } = require("../utils/accessScope");
+const router = express.Router();
+
+// ─────────────────────────────────────────────────────────────────────────
+// FEES
+// Entering/editing a fee payment is General Admin work, the Junior School
+// Admin's for Nursery–JSS, or a Bursar's for their own level (Senior
+// Bursar: SSS, Junior Bursar: Nursery–JSS — enforced by
+// levelScopeViolation() below on every write route). Never the Principal,
+// who can view every payment but never records or changes one. A receipt
+// upload is mandatory on every entry, for every one of these roles alike.
+// ─────────────────────────────────────────────────────────────────────────
+
+const feePopulate = {
+  path: "student",
+  select: "name initials color classId admissionNo",
+  populate: { path: "classId", select: "name level classGroup" },
+};
+
+// Looks up the ANNUAL required fee for a student's level (Nursery/Primary/
+// JSS/SSS) from the class fee configuration, then derives Paid/Partial/Unpaid from
+// the student's cumulative payments for the current academic year — this
+// installment plus every other one already on file (excluding, on an edit,
+// the record being edited itself, so it isn't counted twice). Used by both
+// POST and PUT below so a payment's status is always computed the same
+// way, never trusted from the client.
+async function computeFeeStatus(studentId, amount, excludeFeeId = null) {
+  const student = await User.findById(studentId).populate({
+    path: "classId",
+    select: "name level classGroup",
+  });
+  if (!student) return res.status(404).json({ message: "Student not found" });
+  if (req.user.role !== "student" && !levelAllowed(req.user, student.classId?.level)) return res.status(403).json({ message: "This student is outside your school section" });
+  const settings = await Settings.findOne();
+  // Per-CLASS fee first (Settings → Fee Structure by Class), falling back
+  // to the level-wide figure for any class that hasn't been given its own.
+  const requiredFee = resolveRequiredFee(settings, {
+    level: student?.classId?.level,
+    classGroup: student?.classId?.classGroup,
+    name: student?.classId?.name,
+  });
+  const academicYear = settings?.academicYear || "";
+
+  const otherFilter = { student: studentId, academicYear };
+  if (excludeFeeId) otherFilter._id = { $ne: excludeFeeId };
+  const otherFees = await Fee.find(otherFilter).select("amount");
+  const paidSoFar =
+    otherFees.reduce((s, f) => s + (f.amount || 0), 0) + amount;
+
+  let status = "Unpaid";
+  if (paidSoFar > 0) {
+    status = requiredFee > 0 ? (paidSoFar >= requiredFee ? "Paid" : "Partial") : "Paid";
+  }
+  return { status, expectedAmount: requiredFee, academicYear };
+}
+
+// GET /api/finance - fee records. Principal/Admin/Junior Admin see the
+// whole school (Junior Admin never sees SSS); a student only ever sees
+// their own records; a Teacher sees the whole school too (view-only, same
+// as before) since class teachers are often asked about a student's fee
+// status.
+router.get("/", protect, async (req, res) => {
+  const settings = await Settings.findOne();
+  const filter = { ...yearFilter(settings?.academicYear, req.query.ay) };
+  if (req.query.studentId) filter.student = req.query.studentId;
+  if (req.query.term) filter.term = req.query.term;
+  if (req.user.role === "student") filter.student = req.user._id;
+
+  let fees = await Fee.find(filter).populate(feePopulate).populate("recordedBy", "name role").sort("-paidOn");
+
+  const scope = sectionScope(req.user);
+  if (scope === "junior") fees = fees.filter((f) => f.student?.classId?.level !== "SSS");
+  if (scope === "senior") fees = fees.filter((f) => f.student?.classId?.level === "SSS");
+  if (req.query.level) {
+    fees = fees.filter((f) => f.student?.classId?.level === req.query.level);
+  }
+  if (req.query.classId) {
+    fees = fees.filter(
+      (f) => String(f.student?.classId?._id) === req.query.classId,
+    );
+  }
+  res.json({ fees });
+});
+
+// GET /api/finance/my-summary - a single student's own fee position for
+// the current academic year: the annual fee set for THEIR CLASS, what
+// they've paid so far across every installment, and what's left. Computed
+// here rather than in the browser because the client only ever gets a
+// thinly-populated classId (name only) from /auth/me, and because the fee
+// a class owes is resolved through one helper everywhere (utils/fees.js)
+// so a student can never be shown a different figure from the one the
+// bursar sees on the same class.
+router.get("/my-summary", protect, async (req, res) => {
+  const studentId = req.query.studentId && req.user.role !== "student"
+    ? req.query.studentId
+    : req.user._id;
+  const student = await User.findById(studentId).populate({
+    path: "classId",
+    select: "name level classGroup",
+  });
+  const settings = await Settings.findOne();
+  const academicYear = req.query.ay || settings?.academicYear || "";
+  const requiredFee = resolveRequiredFee(settings, {
+    level: student?.classId?.level,
+    classGroup: student?.classId?.classGroup,
+    name: student?.classId?.name,
+  });
+
+  const fees = await Fee.find({ student: studentId, academicYear }).populate("recordedBy", "name role").sort("-paidOn");
+  const paidToDate = fees.reduce((s, f) => s + (f.amount || 0), 0);
+  const balance = Math.max(0, requiredFee - paidToDate);
+  const status =
+    paidToDate <= 0
+      ? "Unpaid"
+      : requiredFee > 0 && paidToDate >= requiredFee
+        ? "Paid"
+        : "Partial";
+
+  res.json({
+    requiredFee,
+    paidToDate,
+    balance,
+    status,
+    academicYear,
+    payments: fees,
+    class: student?.classId
+      ? {
+          name: student.classId.name,
+          level: student.classId.level,
+          classGroup: student.classId.classGroup,
+        }
+      : null,
+  });
+});
+
+// GET /api/finance/summary - totals for the finance dashboard. The
+// Principal, General Admin, Junior Admin, and both Bursars can all view
+// this. The Junior Admin deliberately sees the FULL school's totals here
+// (including SSS) for transparency, even though they can only ever record
+// or drill into Nursery–JSS fees elsewhere — a Bursar's totals, by
+// contrast, only ever cover their own level. Fees are annual now, so this
+// groups every payment by student first (a student may have several
+// installment records) and works out each student's year-to-date total
+// before summing up — a per-record sum would double-count a student who
+// paid in more than one installment.
+router.get(
+  "/summary",
+  protect,
+  authorize("principal", "juniorAdmin", "seniorBursar", "juniorBursar"),
+  async (req, res) => {
+    const settings = await Settings.findOne();
+    const academicYear = req.query.ay || settings?.academicYear || "";
+    let fees = await Fee.find({ academicYear }).populate({
+      path: "student",
+      select: "classId",
+      populate: { path: "classId", select: "name level classGroup" },
+    });
+    const scope = sectionScope(req.user);
+    if (scope === "junior") fees = fees.filter((f) => f.student?.classId?.level !== "SSS");
+    if (scope === "senior") fees = fees.filter((f) => f.student?.classId?.level === "SSS");
+
+    const byStudent = {};
+    fees.forEach((f) => {
+      const sid = String(f.student?._id || f.student);
+      if (!byStudent[sid]) {
+        byStudent[sid] = {
+          level: f.student?.classId?.level,
+          // Kept alongside the level so each student's required fee can be
+          // resolved against their own CLASS, not just their level.
+          cls: f.student?.classId || null,
+          total: 0,
+        };
+      }
+      byStudent[sid].total += f.amount || 0;
+    });
+
+    let totalCollected = 0;
+    let outstanding = 0;
+    let paidCount = 0;
+    let seniorCollected = 0;
+    let juniorCollected = 0;
+    const totalCount = Object.keys(byStudent).length;
+    Object.values(byStudent).forEach(({ level, cls, total }) => {
+      const requiredFee = resolveRequiredFee(settings, {
+        level,
+        classGroup: cls?.classGroup,
+        name: cls?.name,
+      });
+      totalCollected += total;
+      if (level === "SSS") seniorCollected += total;
+      else if (level) juniorCollected += total;
+      outstanding += Math.max(0, requiredFee - total);
+      const isPaid = requiredFee > 0 ? total >= requiredFee : total > 0;
+      if (isPaid) paidCount += 1;
+    });
+
+    res.json({
+      totalCollected,
+      outstanding,
+      paidCount,
+      totalCount,
+      seniorCollected,
+      juniorCollected,
+    });
+  },
+);
+
+// GET /api/finance/by-class?classId= - every student in a class alongside
+// their YEAR-TO-DATE fee position (defaulting to "Unpaid"/0 for a student
+// with no fee record at all yet). `amount` is the sum of every installment
+// a student has paid this academic year — however many payments that took,
+// and whichever terms they were tagged against — compared to the level's
+// annual fee. `payments` carries the full installment history for that
+// student so the Admin can see how the total was built up. This is what
+// the Fee Payment screen uses to build the "Fully Paid" / "Partial or
+// Unpaid" tables for a level+class the Admin has picked. View-only for the
+// Principal.
+router.get(
+  "/by-class",
+  protect,
+  authorize("principal", "juniorAdmin", "seniorBursar", "juniorBursar"),
+  async (req, res) => {
+    const { classId } = req.query;
+    if (!classId) {
+      return res.status(400).json({ message: "classId is required" });
+    }
+    const cls = await SchoolClass.findById(classId);
+    if (!cls) return res.status(404).json({ message: "Class not found" });
+    if (!levelAllowed(req.user, cls.level)) {
+      return res.status(403).json({ message: "This class is outside your school section" });
+    }
+
+    const students = await User.find({ role: "student", classId })
+      .select("name initials color admissionNo")
+      .sort("name");
+    const studentIds = students.map((s) => s._id);
+
+    const settings = await Settings.findOne();
+    const academicYear = req.query.ay || settings?.academicYear || "";
+    const requiredFee = resolveRequiredFee(settings, {
+      level: cls.level,
+      classGroup: cls.classGroup,
+      name: cls.name,
+    });
+    const feeSource = feeSourceLabel(settings, {
+      level: cls.level,
+      classGroup: cls.classGroup,
+      name: cls.name,
+    });
+
+    const fees = await Fee.find({
+      student: { $in: studentIds },
+      academicYear,
+    }).populate("recordedBy", "name role").sort("-paidOn");
+
+    // Every installment payment a student has made this academic year,
+    // most recent first.
+    const paymentsByStudent = {};
+    fees.forEach((f) => {
+      const key = String(f.student);
+      (paymentsByStudent[key] ||= []).push(f);
+    });
+
+    const rows = students.map((s) => {
+      const payments = paymentsByStudent[String(s._id)] || [];
+      const amount = payments.reduce((sum, f) => sum + (f.amount || 0), 0);
+      const latest = payments[0] || null;
+      const status =
+        amount <= 0 ? "Unpaid" : requiredFee > 0 ? (amount >= requiredFee ? "Paid" : "Partial") : "Paid";
+      return {
+        student: s,
+        fee: latest, // most recent installment — kept for date/receipt display
+        payments, // full installment history for this student, this year
+        status,
+        amount,
+        requiredFee,
+        balance: Math.max(0, requiredFee - amount),
+      };
+    });
+
+    res.json({
+      class: {
+        _id: cls._id,
+        name: cls.name,
+        level: cls.level,
+        classGroup: cls.classGroup,
+        requiredFee,
+        feeSource,
+      },
+      fullyPaid: rows.filter((r) => r.status === "Paid"),
+      notFullyPaid: rows.filter((r) => r.status !== "Paid"),
+    });
+  },
+);
+
+// A bursar, or the Junior School Admin, may only record a fee for a
+// student in their own scope — Senior Bursar: SSS, Junior Bursar/Junior
+// School Admin: Nursery/Primary/JSS. General Admin has no restriction.
+// Returns an error message string if out of scope, otherwise null.
+async function levelScopeViolation(role, studentId) {
+  const user = { role, principalTitle: "" };
+  // This helper is called with role only by the legacy call sites. The explicit
+  // principal roles are handled by studentInScope in the write routes below.
+  if (role !== "seniorBursar" && role !== "juniorBursar" && role !== "juniorAdmin") return null;
+  const ok = await studentInScope(user, studentId);
+  return ok ? null : "This student is outside your school section";
+}
+
+
+// POST /api/finance - record an installment fee payment. General Admin,
+// the Junior School Admin (Nursery–JSS only), or a Bursar for their own
+// level (Senior Bursar: SSS, Junior Bursar: Nursery–JSS). Never the
+// Principal. A receipt upload is mandatory on every entry — enforced here
+// as well as in the schema — for every one of these roles alike.
+router.post(
+  "/",
+  protect,
+  authorize("admin", "juniorAdmin", "seniorBursar", "juniorBursar"),
+  async (req, res) => {
+    try {
+      const violation = (req.user.role === "admin") ? null : ((await studentInScope(req.user, req.body.student)) ? null : "This student is outside your school section");
+      if (violation) return res.status(403).json({ message: violation });
+      if (!req.body.receipt) {
+        return res.status(400).json({
+          message: "A receipt upload is required to record this payment",
+        });
+      }
+      const amount = Number(req.body.amount) || 0;
+      const { status, expectedAmount, academicYear } = await computeFeeStatus(
+        req.body.student,
+        amount,
+      );
+      const fee = await Fee.create({
+        ...req.body,
+        amount,
+        status,
+        expectedAmount,
+        academicYear,
+        recordedBy: req.user._id,
+      });
+      await fee.populate(feePopulate);
+      await fee.populate("recordedBy", "name role");
+      res.status(201).json({ fee });
+    } catch (err) {
+      res.status(400).json({ message: err.message });
+    }
+  },
+);
+
+// PUT /api/finance/:id - update an installment fee payment. Same roles and
+// scope as POST above. The record being edited is excluded from its own
+// cumulative total so editing an amount doesn't count it twice.
+router.put(
+  "/:id",
+  protect,
+  authorize("admin", "juniorAdmin", "seniorBursar", "juniorBursar"),
+  async (req, res) => {
+    try {
+      const violation = (req.user.role === "admin") ? null : ((await studentInScope(req.user, req.body.student)) ? null : "This student is outside your school section");
+      if (violation) return res.status(403).json({ message: violation });
+      if (!req.body.receipt) {
+        return res.status(400).json({
+          message: "A receipt upload is required to record this payment",
+        });
+      }
+      const amount = Number(req.body.amount) || 0;
+      const { status, expectedAmount, academicYear } = await computeFeeStatus(
+        req.body.student,
+        amount,
+        req.params.id,
+      );
+      const body = {
+        ...req.body,
+        amount,
+        status,
+        expectedAmount,
+        academicYear,
+        recordedBy: req.user._id,
+      };
+      const fee = await Fee.findByIdAndUpdate(req.params.id, body, {
+        new: true,
+        runValidators: true,
+      }).populate(feePopulate).populate("recordedBy", "name role");
+      if (!fee) return res.status(404).json({ message: "Fee record not found" });
+      res.json({ fee });
+    } catch (err) {
+      res.status(400).json({ message: err.message });
+    }
+  },
+);
+
+// DELETE /api/finance/:id - remove a fee payment entered in the current
+// academic year. This is deliberately limited to the same roles that can
+// record/edit fees. The receipt is stored on the Fee document itself, so
+// removing the document also removes its uploaded receipt. After deletion,
+// every remaining payment for the student is recalculated so their running
+// Paid/Partial/Unpaid status cannot become stale.
+router.delete(
+  "/:id",
+  protect,
+  authorize("admin", "juniorAdmin", "seniorBursar", "juniorBursar"),
+  async (req, res) => {
+    try {
+      const fee = await Fee.findById(req.params.id);
+      if (!fee) return res.status(404).json({ message: "Fee record not found" });
+
+      const violation = (req.user.role === "admin") ? null : ((await studentInScope(req.user, fee.student)) ? null : "This student is outside your school section");
+      if (violation) return res.status(403).json({ message: violation });
+
+      const settings = await Settings.findOne();
+      const currentAcademicYear = settings?.academicYear || "";
+      if (fee.academicYear && currentAcademicYear && fee.academicYear !== currentAcademicYear) {
+        return res.status(403).json({
+          message: "Payments from a previous academic year cannot be deleted from the archive.",
+        });
+      }
+
+      const studentId = fee.student;
+      await Fee.deleteOne({ _id: fee._id });
+
+      // Rebuild the running status of every remaining payment for this
+      // student/year. This matters when a later installment made the student
+      // fully paid and that installment is now removed.
+      const remaining = await Fee.find({
+        student: studentId,
+        academicYear: fee.academicYear,
+      }).sort({ paidOn: 1, createdAt: 1 });
+
+      const student = await User.findById(studentId).populate({
+        path: "classId",
+        select: "name level classGroup",
+      });
+      const requiredFee = resolveRequiredFee(settings, {
+        level: student?.classId?.level,
+        classGroup: student?.classId?.classGroup,
+        name: student?.classId?.name,
+      });
+
+      let runningTotal = 0;
+      for (const payment of remaining) {
+        runningTotal += payment.amount || 0;
+        payment.expectedAmount = requiredFee;
+        payment.status =
+          runningTotal <= 0
+            ? "Unpaid"
+            : requiredFee > 0 && runningTotal >= requiredFee
+              ? "Paid"
+              : requiredFee > 0
+                ? "Partial"
+                : "Paid";
+        await payment.save();
+      }
+
+      res.json({ message: "Payment deleted", deletedPaymentId: fee._id });
+    } catch (err) {
+      res.status(400).json({ message: err.message });
+    }
+  },
+);
+
+function bankSectionForUser(user) {
+  const scope = sectionScope(user);
+  if (scope === "junior") return "Junior";
+  if (scope === "senior") return "Senior";
+  return null;
+}
+
+function bankSectionQuery(user, requested) {
+  const forced = bankSectionForUser(user);
+  if (forced) return forced;
+  return requested === "Junior" || requested === "Senior" ? requested : null;
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// BANK TRANSACTIONS (deposits/withdrawals)
+// Entering a deposit/withdrawal is General Admin work only — not even the
+// Junior Admin (this is the whole-school bank account, not a level-scoped
+// one) and never the Principal, who can view the ledger for audit purposes
+// but cannot create or edit an entry. There is deliberately no PUT/DELETE
+// here: to prevent tampering with the financial record, a mistake is
+// corrected with a new offsetting entry, never by editing or removing
+// history from the ledger.
+// ─────────────────────────────────────────────────────────────────────────
+
+// GET /api/finance/transactions - Principal (view), General Admin, Junior
+// School Admin (view), and both Bursars (the bank ledger isn't
+// level-split, so either bursar can see and record the whole school's
+// deposits/withdrawals).
+// The ledger itself is NEVER year-scoped — every transaction ever
+// recorded, from every academic year, stays visible and in the database
+// permanently (real money moved; nothing about it is ever reset or
+// deleted). Only the SUMMARY totals below reset per academic year.
+router.get(
+  "/transactions",
+  protect,
+  authorize("principal", "juniorAdmin", "seniorBursar", "juniorBursar"),
+  async (req, res) => {
+  const section = bankSectionQuery(req.user, req.query.section);
+  const filter = section ? { section } : {};
+  const transactions = await BankTransaction.find(filter)
+    .populate("recordedBy", "name role")
+    .sort("-date");
+  res.json({ transactions, section: section || "All" });
+});
+
+// GET /api/finance/transactions/summary - also reports the one-time
+// opening balance (and who/when set it, once it has been) so the ledger's
+// running balance always includes whatever was in the account before this
+// system started tracking it.
+//
+// `deposits` / `withdrawals` are scoped to the CURRENT academic year (or
+// the one requested via ?ay=) — these are what "reset" the moment a new
+// academic year is set, per the General Admin's requirement: nothing in
+// the bank ledger is ever deleted, but the "Total Deposits" / "Total
+// Withdrawals" cards on the finance dashboard should start again from
+// zero for the new year. `balance`, by contrast, is real money and is
+// deliberately computed from the OPENING balance + every transaction ever
+// recorded (all academic years) — a bank balance can never "reset" itself,
+// only the on-screen yearly totals do.
+router.get(
+  "/transactions/summary",
+  protect,
+  authorize("principal", "juniorAdmin", "seniorBursar", "juniorBursar"),
+  async (req, res) => {
+    const settings = await Settings.findOne();
+    const section = bankSectionQuery(req.user, req.query.section);
+    const baseFilter = section ? { section } : {};
+    const [allTransactions, yearTransactions] = await Promise.all([
+      BankTransaction.find(baseFilter),
+      BankTransaction.find({ ...yearFilter(settings?.academicYear, req.query.ay), ...baseFilter }),
+    ]);
+    const sumByType = (list, type) =>
+      list.filter((t) => t.type === type).reduce((s, t) => s + t.amount, 0);
+    const sections = ["Junior", "Senior"].map((name) => {
+      const key = name.toLowerCase();
+      const opening = settings?.bankAccounts?.[key]?.openingBalance ?? (name === "Senior" ? settings?.bankOpeningBalance ?? null : null);
+      const all = allTransactions.filter((t) => t.section === name);
+      const yearly = yearTransactions.filter((t) => t.section === name);
+      return {
+        section: name,
+        deposits: sumByType(yearly, "Deposit"),
+        withdrawals: sumByType(yearly, "Withdrawal"),
+        count: yearly.length,
+        balance: (opening || 0) + sumByType(all, "Deposit") - sumByType(all, "Withdrawal"),
+        openingBalance: opening,
+        openingBalanceSetAt: settings?.bankAccounts?.[key]?.openingBalanceSetAt || (name === "Senior" ? settings?.bankOpeningBalanceSetAt || null : null),
+        openingBalanceSetBy: settings?.bankAccounts?.[key]?.openingBalanceSetBy || (name === "Senior" ? settings?.bankOpeningBalanceSetBy || "" : ""),
+      };
+    });
+    const selected = section ? sections.find((x) => x.section === section) : null;
+    res.json(selected ? selected : { section: "All", sections, deposits: sections.reduce((s,x)=>s+x.deposits,0), withdrawals: sections.reduce((s,x)=>s+x.withdrawals,0), count: sections.reduce((s,x)=>s+x.count,0), balance: sections.reduce((s,x)=>s+x.balance,0), openingBalance: null, openingBalanceSetAt: null, openingBalanceSetBy: "" });
+  },
+);
+
+// POST /api/finance/transactions/opening-balance - records the account's
+// starting balance exactly once. General Admin only. Rejected outright if
+// it's already been set — since the system isn't connected to the bank,
+// this figure has to come from a real statement and must stay a fixed,
+// trustworthy starting point rather than something editable later.
+router.post(
+  "/transactions/opening-balance",
+  protect,
+  authorize("admin", "principal", "juniorAdmin", "seniorBursar", "juniorBursar"),
+  async (req, res) => {
+    const amount = Number(req.body.amount);
+    if (!Number.isFinite(amount) || amount < 0) {
+      return res.status(400).json({ message: "A valid balance amount is required" });
+    }
+    const section = bankSectionQuery(req.user, req.body.section);
+    if (!section) return res.status(400).json({ message: "Choose Junior or Senior bank section" });
+    let settings = await Settings.findOne();
+    if (!settings) settings = new Settings();
+    if (!settings.bankAccounts) settings.bankAccounts = {};
+    const key = section.toLowerCase();
+    const account = settings.bankAccounts[key] || {};
+    if (account.openingBalanceSetAt || (section === "Senior" && settings.bankOpeningBalanceSetAt)) {
+      return res.status(400).json({ message: `${section} opening bank balance has already been recorded and cannot be changed.` });
+    }
+    settings.bankAccounts[key] = { openingBalance: amount, openingBalanceSetAt: new Date(), openingBalanceSetBy: req.user.name };
+    // Keep the legacy senior fields in sync for old clients/data.
+    if (section === "Senior") {
+      settings.bankOpeningBalance = amount;
+      settings.bankOpeningBalanceSetAt = settings.bankAccounts[key].openingBalanceSetAt;
+      settings.bankOpeningBalanceSetBy = req.user.name;
+    }
+    await settings.save();
+    res.status(201).json({ section, ...settings.bankAccounts[key].toObject?.() || settings.bankAccounts[key] });
+  },
+);
+
+// POST /api/finance/transactions - General Admin or either Bursar. A
+// slip/receipt upload is required on every entry (slipUrl) — enforced here
+// as well as in the schema, so a request that omits it gets a clear
+// message instead of a raw Mongoose validation error.
+router.post(
+  "/transactions",
+  protect,
+  authorize("admin", "seniorBursar", "juniorBursar"),
+  async (req, res) => {
+  try {
+    if (!req.body.slipUrl) {
+      return res.status(400).json({
+        message: "A photo/scan of the deposit or withdrawal slip is required",
+      });
+    }
+    const forcedSection = bankSectionQuery(req.user, req.body.section);
+    if (!forcedSection) return res.status(400).json({ message: "Choose Junior or Senior bank section" });
+    const txn = await BankTransaction.create({
+      ...req.body,
+      section: forcedSection,
+      recordedBy: req.user._id,
+    });
+    await txn.populate("recordedBy", "name role");
+    res.status(201).json({ transaction: txn });
+  } catch (err) {
+    res.status(400).json({ message: err.message });
+  }
+});
+
+module.exports = router;
