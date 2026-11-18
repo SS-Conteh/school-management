@@ -78,6 +78,14 @@ router.get("/", protect, async (req, res) => {
     // above.
     if (req.query.term) gradeYearMatch.term = req.query.term;
 
+    // Six-month trends power the dashboard's interactive charts. These are
+    // aggregated in MongoDB and use the same section/year boundaries as the
+    // headline figures above.
+    const trendStart = new Date();
+    trendStart.setDate(1);
+    trendStart.setHours(0, 0, 0, 0);
+    trendStart.setMonth(trendStart.getMonth() - 5);
+
     const [
       teacherCount,
       studentCount,
@@ -85,6 +93,9 @@ router.get("/", protect, async (req, res) => {
       todaysAttendance,
       feeAgg,
       notices,
+      classCount,
+      attendanceTrend,
+      feeTrend,
     ] = await Promise.all([
       User.countDocuments(scopeTeacherFilter),
       User.countDocuments(scopeStudentFilter),
@@ -131,6 +142,50 @@ router.get("/", protect, async (req, res) => {
         if (scope !== "all") noticeFilter.section = scope === "junior" ? "Junior" : "Senior";
         return Notice.find(noticeFilter).sort("-createdAt").limit(3).lean();
       })(),
+      scope !== "all"
+        ? SchoolClass.countDocuments({ _id: { $in: scopeClassIds } })
+        : SchoolClass.countDocuments({}),
+      Attendance.aggregate([
+        {
+          $match: {
+            ...yearFilter(settings?.academicYear, requestedYear),
+            date: { $gte: trendStart },
+            ...(scope !== "all" ? { classId: { $in: scopeClassIds } } : {}),
+          },
+        },
+        {
+          $group: {
+            _id: { $dateToString: { format: "%Y-%m", date: "$date" } },
+            total: { $sum: 1 },
+            present: {
+              $sum: { $cond: [{ $ne: ["$status", "Absent"] }, 1, 0] },
+            },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
+      Fee.aggregate([
+        {
+          $match: {
+            academicYear: requestedYear || settings?.academicYear || "",
+            paidOn: { $gte: trendStart },
+          },
+        },
+        ...(scope !== "all"
+          ? [
+              { $lookup: { from: "users", localField: "student", foreignField: "_id", as: "studentDoc" } },
+              { $unwind: "$studentDoc" },
+              { $match: { "studentDoc.classId": { $in: scopeClassIds } } },
+            ]
+          : []),
+        {
+          $group: {
+            _id: { $dateToString: { format: "%Y-%m", date: "$paidOn" } },
+            amount: { $sum: "$amount" },
+          },
+        },
+        { $sort: { _id: 1 } },
+      ]),
     ]);
 
     const avgGrade = gradeAgg[0] ? Math.round((gradeAgg[0].avg + Number.EPSILON) * 10) / 10 : 0;
@@ -149,7 +204,9 @@ router.get("/", protect, async (req, res) => {
       attendanceRateToday,
       avgGrade,
       feesCollected,
-      pendingReports: 5,
+      classCount,
+      attendanceTrend,
+      feeTrend,
       notices,
     });
   }
@@ -241,6 +298,8 @@ router.get("/", protect, async (req, res) => {
       attendanceRate,
       avgScore,
       pendingGrades,
+      assignedStudentCount: scopeStudents.length,
+      gradedCount: subjectGrades.length,
     });
   }
 

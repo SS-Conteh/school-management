@@ -2,8 +2,10 @@ const express = require("express");
 const SchoolClass = require("../models/SchoolClass");
 const User = require("../models/User");
 const Grade = require("../models/Grade");
+const Settings = require("../models/Settings");
 const { protect, authorize } = require("../middleware/auth");
 const { sectionScope, levelsForScope } = require("../utils/accessScope");
+const { yearFilter } = require("../utils/academicYear");
 
 const router = express.Router();
 
@@ -42,6 +44,8 @@ router.get("/", protect, async (req, res) => {
     .lean();
 
   const classIds = classes.map((c) => c._id);
+  const settings = await Settings.findOne().select("academicYear").lean();
+  const gradeYearMatch = yearFilter(settings?.academicYear, req.query.ay);
 
   // One aggregation instead of 2 extra queries per class (N+1): join each
   // student to their grades and roll everything up per classId in the DB.
@@ -51,8 +55,15 @@ router.get("/", protect, async (req, res) => {
         {
           $lookup: {
             from: "grades",
-            localField: "_id",
-            foreignField: "student",
+            let: { studentId: "$_id" },
+            pipeline: [
+              {
+                $match: {
+                  $expr: { $eq: ["$student", "$$studentId"] },
+                  ...gradeYearMatch,
+                },
+              },
+            ],
             as: "grades",
           },
         },

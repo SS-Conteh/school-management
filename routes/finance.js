@@ -183,6 +183,23 @@ router.get(
       byStudent[sid].total += f.amount || 0;
     });
 
+    // Six-month fee collection trend for the finance dashboard. The fee
+    // list is already restricted to the caller's school section and the
+    // selected academic year above, so this chart cannot cross sections.
+    const trendStart = new Date();
+    trendStart.setDate(1);
+    trendStart.setHours(0, 0, 0, 0);
+    trendStart.setMonth(trendStart.getMonth() - 5);
+    const monthlyCollection = {};
+    fees.forEach((fee) => {
+      if (!fee.paidOn || new Date(fee.paidOn) < trendStart) return;
+      const key = new Date(fee.paidOn).toISOString().slice(0, 7);
+      monthlyCollection[key] = (monthlyCollection[key] || 0) + Number(fee.amount || 0);
+    });
+    const feeTrend = Object.entries(monthlyCollection)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([_id, amount]) => ({ _id, amount }));
+
     let totalCollected = 0;
     let outstanding = 0;
     let paidCount = 0;
@@ -210,6 +227,7 @@ router.get(
       totalCount,
       seniorCollected,
       juniorCollected,
+      feeTrend,
     });
   },
 );
